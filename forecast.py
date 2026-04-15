@@ -2,9 +2,6 @@
 Gas Forecast & Daily Briefing
 Scrapes today's gas price + change indicator from gaswizard.ca
 and sends a concise SMS via the Freedom Mobile email-to-SMS gateway.
-
-Source: https://gaswizard.ca/gas-prices/{city}/
-Covers all major Ontario (and Canadian) cities — no API key required.
 """
 
 import os
@@ -34,6 +31,7 @@ RECIPIENTS = [
 GMAIL_USER     = os.environ.get("GMAIL_USER", "")
 GMAIL_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 SMS_GATEWAY    = "txt.freedommobile.ca"
+DEBUG          = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
 
 BASE_URL = "https://gaswizard.ca/gas-prices/{city}/"
 HEADERS  = {
@@ -45,18 +43,8 @@ HEADERS  = {
 }
 
 
-# ── Scraping ──────────────────────────────────────────────────────────────────
+# ── Scraping ───────────────────────────────────────────────────────────────────
 def fetch_gas_forecast(city: str) -> dict:
-    """
-    Scrape today's regular gas price and change from gaswizard.ca.
-
-    Returns a dict with keys:
-        city      (str)         — display name
-        price     (float|None)  — price in cents/litre, e.g. 174.9
-        change    (str)         — raw change string e.g. "+3.0", "-2.0", "n/c"
-        trend     (str)         — "▲", "▼", or "→"
-    Raises RuntimeError on network or parse failure.
-    """
     slug = city.lower().replace(" ", "-")
     url  = BASE_URL.format(city=slug)
 
@@ -68,103 +56,96 @@ def fetch_gas_forecast(city: str) -> dict:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    price, change, trend = _parse_price_block(soup)
+    if DEBUG:
+        # Dump first 3000 chars of visible text to help diagnose layout changes
+        preview = soup.get_text(" ", strip=True)[:3000]
+        print(f"[DEBUG] Page text preview:\n{preview}\n")
 
-    # Derive a clean display name from the page <h1>
+    price, change, trend = _parse_price_block(soup, resp.text)
+
     h1 = soup.find("h1")
     display_name = city.title()
     if h1:
         text = h1.get_text(strip=True)
-        # "Tomorrow's Gas Price for Toronto" → "Toronto"
         m = re.search(r"for (.+)$", text, re.IGNORECASE)
         if m:
             display_name = m.group(1).strip()
 
-    return {
-        "city":   display_name,
-        "price":  price,
-        "change": change,
-        "trend":  trend,
-    }
+    return {"city": display_name, "price": price, "change": change, "trend": trend}
 
 
-def _parse_price_block(soup: BeautifulSoup):
+def _parse_price_block(soup: BeautifulSoup, raw_html: str):
     """
-    Find the regular gas price and change indicator for today.
-    Returns (price_float_or_None, change_str, trend_str).
+    Try multiple strategies to extract the Regular gas price and change.
+    Returns (price_float, change_str, trend_str).
     """
-    # Pattern: 2-3 digit price, optional decimal, then parenthesised change
-    # e.g. "174.9 (n/c)"  "168.9 (+3.0)"  "171.9 (-2.0)"
+
+    # Strategy 1 — original pattern: "174.9 (n/c)" or "168.9 (+3.0)"
     PRICE_RE = re.compile(
         r"(\d{2,3}(?:\.\d)?)\s*\((n/c|[+-]\d+(?:\.\d)?)\)",
         re.IGNORECASE,
     )
 
-    # Grab all list items; the first one that contains "Regular" is today's block
+    # Search within <li> tags containing "Regular" first
     for li in soup.find_all("li"):
         text = li.get_text(" ", strip=True)
-        if "Regular" not in text:
-            continue
-        m = PRICE_RE.search(text)
-        if m:
-            price_str  = m.group(1)
-            change_str = m.group(2)
-            price      = float(price_str)
-            trend      = _trend(change_str)
-            return price, change_str, trend
+        if "regular" in text.lower():
+            m = PRICE_RE.search(text)
+            if m:
+                return float(m.group(1)), m.group(2), _trend(m.group(2))
 
-    # Fallback: scan the whole page for the pattern
-    full_text = soup.get_text(" ")
+    # Strategy 2 — scan all visible text (catches tables, divs, spans)
+    full_text = soup.get_text(" ", strip=True)
     m = PRICE_RE.search(full_text)
     if m:
-        price_str  = m.group(1)
-        change_str = m.group(2)
-        return float(price_str), change_str, _trend(change_str)
+        return float(m.group(1)), m.group(2), _trend(m.group(2))
+
+    # Strategy 3 — price only, no change indicator (e.g. "Regular 174.9")
+    PRICE_ONLY_RE = re.compile(
+        r"[Rr]egular[^\d]{0,20}(\d{2,3}(?:\.\d)?)",
+    )
+    m = PRICE_ONLY_RE.search(full_text)
+    if m:
+        price = float(m.group(1))
+        return price, "n/c", "→"
+
+    # Strategy 4 — scan raw HTML (catches JSON-in-script blocks, data attributes)
+    m = PRICE_RE.search(raw_html)
+    if m:
+        return float(m.group(1)), m.group(2), _trend(m.group(2))
+
+    # Strategy 5 — any standalone 3-digit price in the 100–199 range
+    STANDALONE_RE = re.compile(r"\b(1\d{2}(?:\.\d)?)\b")
+    candidates = STANDALONE_RE.findall(full_text)
+    if candidates:
+        price = float(candidates[0])
+        return price, "n/c", "→"
 
     raise RuntimeError(
-        "Could not parse a gas price from gaswizard.ca. "
-        "The page layout may have changed."
+        "Could not parse a gas price from gaswizard.ca — "
+        "the page layout may have changed, or this city has no data. "
+        "Set DEBUG=true in your env to see raw page content."
     )
 
 
 def _trend(change_str: str) -> str:
     s = change_str.strip().lower()
-    if s == "n/c" or s == "0":
+    if s in ("n/c", "0"):
         return "→"
-    if s.startswith("+"):
-        return "▲"
-    if s.startswith("-"):
-        return "▼"
-    return "→"
+    return "▲" if s.startswith("+") else "▼" if s.startswith("-") else "→"
 
 
-# ── Message Formatting ────────────────────────────────────────────────────────
+# ── Message Formatting ─────────────────────────────────────────────────────────
 def build_sms(data: dict) -> str:
-    """
-    Build a message under 140 characters.
-    Example outputs:
-      ⛽ Toronto | 174.9¢ (n/c) → | Apr 14
-      ⛽ Waterloo | 171.9¢ (-3.0) ▼ | Apr 14
-    """
     price_str  = f"{data['price']:.1f}¢" if data["price"] is not None else "N/A"
-    change_str = data["change"] if data["change"] else ""
+    change_str = data["change"] or ""
     date_str   = datetime.now().strftime("%b %-d")
-
-    msg = (
-        f"⛽ {data['city']} | "
-        f"{price_str} ({change_str}) {data['trend']} | "
-        f"{date_str}"
-    )
-
-    if len(msg) > 140:
-        msg = msg[:137] + "..."
-
-    return msg
+    msg = f"⛽ {data['city']} | {price_str} ({change_str}) {data['trend']} | {date_str}"
+    return msg[:137] + "..." if len(msg) > 140 else msg
 
 
-# ── SMS Sending ───────────────────────────────────────────────────────────────
+# ── SMS Sending ────────────────────────────────────────────────────────────────
 def send_sms(phone: str, message: str) -> None:
-    """Send message via Freedom Mobile email-to-SMS gateway using Gmail SMTP."""
     if not phone:
         raise ValueError("TARGET_PHONE_NUMBER is not set.")
     if not GMAIL_USER or not GMAIL_PASSWORD:
@@ -183,10 +164,9 @@ def send_sms(phone: str, message: str) -> None:
     print(f"✓ SMS sent to {to_address}: {message}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     errors = []
-
     for phone, city in RECIPIENTS:
         try:
             print(f"→ Fetching forecast for {city}...")
@@ -201,8 +181,7 @@ def main():
 
     if errors:
         print("\nCompleted with errors:")
-        for e in errors:
-            print(" ", e)
+        for e in errors: print(" ", e)
         raise SystemExit(1)
 
 
