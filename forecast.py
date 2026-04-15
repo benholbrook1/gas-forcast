@@ -1,37 +1,23 @@
 """
 Gas Forecast & Daily Briefing
 Scrapes today's gas price + change indicator from gaswizard.ca
-and sends a concise SMS via the Freedom Mobile email-to-SMS gateway.
+and sends a message via Discord webhook.
 """
 
 import os
 import re
-import smtplib
 import requests
 from bs4 import BeautifulSoup
-from email.mime.text import MIMEText
 from datetime import datetime
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-# Each entry: (phone_number, city_slug)
-# City slugs match gaswizard.ca URL paths — see full list at:
-# https://gaswizard.ca/gas-price-predictions/
-#
-# Ontario examples:
-#   toronto, gta, ottawa, hamilton, london, kitchener, waterloo,
-#   windsor, barrie, kingston, mississauga, brampton, markham,
-#   oakville, oshawa, niagara, sudbury, thunder-bay, peterborough
-RECIPIENTS = [
-    (os.environ.get("TARGET_PHONE_NUMBER", ""), os.environ.get("TARGET_CITY", "toronto")),
-    # Add more recipients here, e.g.:
-    # ("5551234567", "waterloo"),
-    # ("5559876543", "ottawa"),
+# ── Configuration ──────────────────────────────────────────────────────────────
+CITIES = [
+    os.environ.get("TARGET_CITY", "waterloo"),
+    # Add more cities here, e.g.: "ottawa", "toronto"
 ]
 
-GMAIL_USER     = os.environ.get("GMAIL_USER", "")
-GMAIL_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
-SMS_GATEWAY    = "txt.freedommobile.ca"
-DEBUG          = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+DEBUG               = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
 
 BASE_URL = "https://gaswizard.ca/gas-prices/{city}/"
 HEADERS  = {
@@ -57,7 +43,6 @@ def fetch_gas_forecast(city: str) -> dict:
     soup = BeautifulSoup(resp.text, "html.parser")
 
     if DEBUG:
-        # Dump first 3000 chars of visible text to help diagnose layout changes
         preview = soup.get_text(" ", strip=True)[:3000]
         print(f"[DEBUG] Page text preview:\n{preview}\n")
 
@@ -75,18 +60,11 @@ def fetch_gas_forecast(city: str) -> dict:
 
 
 def _parse_price_block(soup: BeautifulSoup, raw_html: str):
-    """
-    Try multiple strategies to extract the Regular gas price and change.
-    Returns (price_float, change_str, trend_str).
-    """
-
-    # Strategy 1 — original pattern: "174.9 (n/c)" or "168.9 (+3.0)"
     PRICE_RE = re.compile(
         r"(\d{2,3}(?:\.\d)?)\s*\((n/c|[+-]\d+(?:\.\d)?)\)",
         re.IGNORECASE,
     )
 
-    # Search within <li> tags containing "Regular" first
     for li in soup.find_all("li"):
         text = li.get_text(" ", strip=True)
         if "regular" in text.lower():
@@ -94,32 +72,24 @@ def _parse_price_block(soup: BeautifulSoup, raw_html: str):
             if m:
                 return float(m.group(1)), m.group(2), _trend(m.group(2))
 
-    # Strategy 2 — scan all visible text (catches tables, divs, spans)
     full_text = soup.get_text(" ", strip=True)
     m = PRICE_RE.search(full_text)
     if m:
         return float(m.group(1)), m.group(2), _trend(m.group(2))
 
-    # Strategy 3 — price only, no change indicator (e.g. "Regular 174.9")
-    PRICE_ONLY_RE = re.compile(
-        r"[Rr]egular[^\d]{0,20}(\d{2,3}(?:\.\d)?)",
-    )
+    PRICE_ONLY_RE = re.compile(r"[Rr]egular[^\d]{0,20}(\d{2,3}(?:\.\d)?)")
     m = PRICE_ONLY_RE.search(full_text)
     if m:
-        price = float(m.group(1))
-        return price, "n/c", "→"
+        return float(m.group(1)), "n/c", "→"
 
-    # Strategy 4 — scan raw HTML (catches JSON-in-script blocks, data attributes)
     m = PRICE_RE.search(raw_html)
     if m:
         return float(m.group(1)), m.group(2), _trend(m.group(2))
 
-    # Strategy 5 — any standalone 3-digit price in the 100–199 range
     STANDALONE_RE = re.compile(r"\b(1\d{2}(?:\.\d)?)\b")
     candidates = STANDALONE_RE.findall(full_text)
     if candidates:
-        price = float(candidates[0])
-        return price, "n/c", "→"
+        return float(candidates[0]), "n/c", "→"
 
     raise RuntimeError(
         "Could not parse a gas price from gaswizard.ca — "
@@ -136,52 +106,57 @@ def _trend(change_str: str) -> str:
 
 
 # ── Message Formatting ─────────────────────────────────────────────────────────
-def build_sms(data: dict) -> str:
+def build_message(data: dict) -> str:
     price_str  = f"{data['price']:.1f}¢" if data["price"] is not None else "N/A"
     change_str = data["change"] or ""
     date_str   = datetime.now().strftime("%b %-d")
-    msg = f"⛽ {data['city']} | {price_str} ({change_str}) {data['trend']} | {date_str}"
-    return msg[:137] + "..." if len(msg) > 140 else msg
+    return f"⛽ **{data['city']}** | {price_str} ({change_str}) {data['trend']} | {date_str}"
 
 
-# ── SMS Sending ────────────────────────────────────────────────────────────────
-def send_sms(phone: str, message: str) -> None:
-    if not phone:
-        raise ValueError("TARGET_PHONE_NUMBER is not set.")
-    if not GMAIL_USER or not GMAIL_PASSWORD:
-        raise ValueError("GMAIL_USER or GMAIL_APP_PASSWORD is not set.")
+# ── Discord Sending ────────────────────────────────────────────────────────────
+def send_discord(message: str) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        raise ValueError("DISCORD_WEBHOOK_URL is not set.")
 
-    to_address = f"{phone}@{SMS_GATEWAY}"
-    mime = MIMEText(message)
-    mime["From"]    = GMAIL_USER
-    mime["To"]      = to_address
-    mime["Subject"] = ""
+    resp = requests.post(
+        DISCORD_WEBHOOK_URL,
+        json={"content": message},
+        timeout=10,
+    )
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(GMAIL_USER, GMAIL_PASSWORD)
-        server.sendmail(GMAIL_USER, to_address, mime.as_string())
+    if resp.status_code not in (200, 204):
+        raise RuntimeError(
+            f"Discord webhook failed: {resp.status_code} {resp.text}"
+        )
 
-    print(f"✓ SMS sent to {to_address}: {message}")
+    print(f"✓ Discord message sent: {message}")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
-    errors = []
-    for phone, city in RECIPIENTS:
+    errors  = []
+    lines   = []
+
+    for city in CITIES:
         try:
             print(f"→ Fetching forecast for {city}...")
-            data    = fetch_gas_forecast(city)
-            message = build_sms(data)
-            print(f"  Message ({len(message)} chars): {message}")
-            send_sms(phone, message)
+            data = fetch_gas_forecast(city)
+            lines.append(build_message(data))
         except Exception as e:
-            err = f"[ERROR] {city} / {phone}: {e}"
+            err = f"[ERROR] {city}: {e}"
             print(err)
             errors.append(err)
 
+    if lines:
+        try:
+            send_discord("\n".join(lines))
+        except Exception as e:
+            errors.append(f"[ERROR] Discord send: {e}")
+
     if errors:
         print("\nCompleted with errors:")
-        for e in errors: print(" ", e)
+        for e in errors:
+            print(" ", e)
         raise SystemExit(1)
 
 
