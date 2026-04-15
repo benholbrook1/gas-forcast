@@ -29,8 +29,7 @@ jobs:
 
       - name: Run forecast script
         env:
-          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}        
           TARGET_PHONE_NUMBER: ${{ secrets.TARGET_PHONE_NUMBER }}
           TARGET_CITY:        ${{ secrets.TARGET_CITY }}   # e.g. toronto, ottawa, hamilton
         run: python forecast.py
