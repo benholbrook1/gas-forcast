@@ -27,9 +27,30 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Required repo secrets: GEMINI_API_KEY, TWILIO_*, TARGET_CITY (or TARGET_CITIES).
+      # Optional: GEMINI_MODEL, REGION, TIMEZONE, SMS_TEMPLATE, SMS_MAX_LEN, DRY_RUN.
       - name: Run forecast script
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}        
-          TARGET_PHONE_NUMBER: ${{ secrets.TARGET_PHONE_NUMBER }}
-          TARGET_CITY:        ${{ secrets.TARGET_CITY }}   # e.g. toronto, ottawa, hamilton
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_FROM_NUMBER: ${{ secrets.TWILIO_FROM_NUMBER }}
+          TWILIO_TO_NUMBER: ${{ secrets.TWILIO_TO_NUMBER }}
+          TARGET_CITY: ${{ secrets.TARGET_CITY }}
+          TARGET_CITIES: ${{ secrets.TARGET_CITIES }}
+          REGION: ${{ secrets.REGION }}
+          TIMEZONE: ${{ secrets.TIMEZONE }}
+          SMS_TEMPLATE: ${{ secrets.SMS_TEMPLATE }}
+          SMS_MAX_LEN: ${{ secrets.SMS_MAX_LEN }}
+          LOG_DIR: logs
+          DRY_RUN: ${{ secrets.DRY_RUN }}
         run: python forecast.py
+
+      - name: Upload forecast logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forecast-logs-${{ github.run_id }}
+          path: logs/
+          if-no-files-found: warn
