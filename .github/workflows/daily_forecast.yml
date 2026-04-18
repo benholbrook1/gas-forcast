@@ -27,8 +27,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Required repo secrets: GEMINI_API_KEY, TWILIO_*, TARGET_CITY (or TARGET_CITIES).
-      # Optional: GEMINI_MODEL, REGION, TIMEZONE, SMS_TEMPLATE, SMS_MAX_LEN, DRY_RUN.
+      # Required: GEMINI_API_KEY, TWILIO_*, multiline RECIPIENTS ("phone, city" per line).
+      # Optional: GEMINI_MODEL, REGION, TIMEZONE, SMS_TEMPLATE, SMS_MAX_LEN, SMS_MAX_LEN_DETAILED, DRY_RUN.
       - name: Run forecast script
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -36,13 +36,12 @@ jobs:
           TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
           TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
           TWILIO_FROM_NUMBER: ${{ secrets.TWILIO_FROM_NUMBER }}
-          TWILIO_TO_NUMBER: ${{ secrets.TWILIO_TO_NUMBER }}
-          TARGET_CITY: ${{ secrets.TARGET_CITY }}
-          TARGET_CITIES: ${{ secrets.TARGET_CITIES }}
+          RECIPIENTS: ${{ secrets.RECIPIENTS }}
           REGION: ${{ secrets.REGION }}
           TIMEZONE: ${{ secrets.TIMEZONE }}
           SMS_TEMPLATE: ${{ secrets.SMS_TEMPLATE }}
           SMS_MAX_LEN: ${{ secrets.SMS_MAX_LEN }}
+          SMS_MAX_LEN_DETAILED: ${{ secrets.SMS_MAX_LEN_DETAILED }}
           LOG_DIR: logs
           DRY_RUN: ${{ secrets.DRY_RUN }}
         run: python forecast.py

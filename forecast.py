@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 import re
+from collections import OrderedDict
 
 from dotenv import load_dotenv
 from google import genai
@@ -31,6 +32,16 @@ class Forecast:
     recommendation: str
 
 
+@dataclass(frozen=True)
+class Recipient:
+    """One SMS destination and the city forecast they should receive."""
+
+    to_e164: str
+    city_label: str  # human/Gemini location name (e.g. "Waterloo")
+    city_key: str  # normalized key for grouping (lowercase, single spaces)
+    sms_template: str  # "compact" | "detailed"
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.environ.get(name)
     if v is None:
@@ -45,10 +56,151 @@ def _env_required(name: str) -> str:
     return v
 
 
-def _parse_cities() -> list[str]:
-    raw = (os.environ.get("TARGET_CITIES") or os.environ.get("TARGET_CITY") or "waterloo").strip()
-    parts = [p.strip() for p in raw.split(",")]
-    return [p for p in parts if p]
+def _city_key(name: str) -> str:
+    return " ".join(name.strip().lower().split())
+
+
+_SMS_TEMPLATE_ALIASES = {"detail": "detailed", "short": "compact"}
+
+
+def _is_sms_template_token(s: str) -> bool:
+    t = _SMS_TEMPLATE_ALIASES.get(s.strip().lower(), s.strip().lower())
+    return t in ("compact", "detailed")
+
+
+def _validated_sms_template(name: str) -> str:
+    t = (name or "").strip().lower()
+    t = _SMS_TEMPLATE_ALIASES.get(t, t)
+    if t not in ("compact", "detailed"):
+        raise ValueError(f"SMS template must be 'compact' or 'detailed', not {name!r}")
+    return t
+
+
+def _sms_max_len_for_template(template: str) -> int:
+    """Length cap for SMS body. 0 means no cap. ``compact`` uses SMS_MAX_LEN; ``detailed`` uses SMS_MAX_LEN_DETAILED (default 0 = full message, often multi-segment)."""
+    t = _validated_sms_template(template)
+    if t == "detailed":
+        raw = (os.environ.get("SMS_MAX_LEN_DETAILED") or "0").strip()
+        return int(raw or "0")
+    raw = (os.environ.get("SMS_MAX_LEN") or "122").strip()
+    return int(raw or "0")
+
+
+def _default_phone_country_prefix() -> str:
+    return (os.environ.get("DEFAULT_PHONE_COUNTRY_PREFIX") or "1").strip().lstrip("+") or "1"
+
+
+def _normalize_phone_e164(raw_phone: str) -> str:
+    p = re.sub(r"[\s\-\(\)]", "", (raw_phone or "").strip())
+    if not p:
+        raise ValueError("Empty phone number.")
+    if p.startswith("+"):
+        return p
+    cc = _default_phone_country_prefix()
+    if re.fullmatch(r"\d{10}", p):
+        return f"+{cc}{p}"
+    if re.fullmatch(rf"{cc}\d{{10}}", p):
+        return f"+{p}"
+    if re.fullmatch(r"\d{11,15}", p):
+        return f"+{p}"
+    raise ValueError(f"Unrecognized phone format: {raw_phone!r} (use 10 digits or +E.164)")
+
+
+def _recipients_config_raw() -> str:
+    path = (os.environ.get("RECIPIENTS_FILE") or "").strip()
+    if path:
+        p = Path(path).expanduser()
+        try:
+            return p.read_text(encoding="utf-8")
+        except OSError as e:
+            raise RuntimeError(f"Could not read RECIPIENTS_FILE {p}: {e}") from e
+    return os.environ.get("RECIPIENTS") or ""
+
+
+def _parse_recipients_from_env(*, default_template: str) -> list[Recipient]:
+    """
+    Multiline config: one row per recipient, ``phone, city`` or ``phone, city, template``.
+
+    ``template`` is optional; when omitted, ``default_template`` (from ``SMS_TEMPLATE``) is used.
+    If the line has three or more comma segments and the last segment is ``compact`` or
+    ``detailed``, it is treated as the template and the middle segments form the city (so
+    ``city, province`` style names can include commas without a template).
+
+    Set ``RECIPIENTS`` (use double-quoted multiline in ``.env``) or ``RECIPIENTS_FILE``.
+
+    Example::
+
+        226-792-8781, waterloo, compact
+        324-543-2356, burlington, detailed
+        324-352-2356, waterloo
+    """
+    block = _recipients_config_raw().strip()
+    if not block:
+        return []
+
+    default_t = _validated_sms_template(default_template)
+    out: list[Recipient] = []
+    for line in block.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "," not in line:
+            raise ValueError(
+                f"Invalid RECIPIENTS line (expected 'phone, city' or 'phone, city, template'): {line!r}"
+            )
+        parts = [p.strip() for p in line.split(",")]
+        if not parts or not parts[0]:
+            raise ValueError(f"Invalid RECIPIENTS line: {line!r}")
+
+        phone_part = parts[0]
+        tmpl = default_t
+        if len(parts) >= 3 and _is_sms_template_token(parts[-1]):
+            tmpl = _validated_sms_template(parts[-1])
+            city_raw = ", ".join(parts[1:-1]).strip()
+        else:
+            city_raw = ", ".join(parts[1:]).strip()
+
+        if not city_raw:
+            raise ValueError(f"Missing city in RECIPIENTS line: {line!r}")
+
+        to_e164 = _normalize_phone_e164(phone_part)
+        ck = _city_key(city_raw)
+        label = " ".join(city_raw.split())
+        out.append(
+            Recipient(
+                to_e164=to_e164,
+                city_label=label,
+                city_key=ck,
+                sms_template=tmpl,
+            )
+        )
+    return out
+
+
+def _group_recipients_by_city_and_template(
+    recipients: list[Recipient],
+) -> list[tuple[str, str, str, list[str]]]:
+    """
+    One Gemini call per distinct (city, template). Returns list of
+    (city_key, city_label, template, [e164, ...]) in first-seen order.
+    """
+    order: list[tuple[str, str]] = []
+    labels: dict[tuple[str, str], str] = {}
+    phones: dict[tuple[str, str], OrderedDict[str, None]] = {}
+
+    for r in recipients:
+        key = (r.city_key, r.sms_template)
+        if key not in phones:
+            order.append(key)
+            labels[key] = r.city_label
+            phones[key] = OrderedDict()
+        if r.to_e164 not in phones[key]:
+            phones[key][r.to_e164] = None
+
+    return [
+        (city_key, labels[(city_key, tmpl)], tmpl, list(phones[(city_key, tmpl)].keys()))
+        for city_key, tmpl in order
+    ]
 
 
 def _tomorrow_local_date_str(tz_name: str) -> str:
@@ -207,10 +359,6 @@ Guidance:
     return forecast, sources, _extract_grounding_web_search_queries(resp)
 
 
-def format_sms(forecast: Forecast) -> str:
-    raise RuntimeError("Use format_sms_with_template()")
-
-
 def _squeeze(s: str) -> str:
     return " ".join((s or "").strip().split())
 
@@ -236,15 +384,8 @@ def format_sms_with_template(
     Supported templates:
     - "detailed": multi-line detailed briefing (the full template you liked)
     - "compact": tomorrow price (¢/L) then recommendation
-
-    Backward compatible aliases:
-    - "recommendation_only" -> "compact"
     """
     template = (template or "compact").strip().lower()
-    if template == "recommendation_only":
-        template = "compact"
-    if template == "full":
-        template = "detailed"
 
     if template == "detailed":
         lines: list[str] = []
@@ -268,7 +409,11 @@ def format_sms_with_template(
         lines.append(f"Recommendation: {_squeeze(forecast.recommendation)}".strip())
 
         body = "\n".join(lines).strip()
-        return _truncate(body, max_len) if max_len > 0 else body
+        # Do not run detailed text through _truncate/_squeeze: that collapses newlines and
+        # makes long briefings look like a single short "compact" blurb when max_len is small.
+        if max_len <= 0 or len(body) <= max_len:
+            return body
+        return body[: max_len - 1].rstrip() + "…"
 
     if template == "compact":
         price_line = f"Tomorrow's Expected Price: {forecast.tomorrow_expected_price_cents_per_liter:.1f}¢/L"
@@ -291,34 +436,20 @@ def format_sms_with_template(
     raise ValueError(f"Unknown SMS_TEMPLATE: {template!r}")
 
 
-def send_sms_via_twilio(*, body: str) -> str:
+def send_sms_via_twilio(*, body: str, to_numbers: list[str]) -> list[str]:
     account_sid = _env_required("TWILIO_ACCOUNT_SID")
     auth_token = _env_required("TWILIO_AUTH_TOKEN")
     from_number = _env_required("TWILIO_FROM_NUMBER")
 
-    raw_to = (os.environ.get("TWILIO_TO_NUMBERS") or os.environ.get("TWILIO_TO_NUMBER") or "").strip()
-    if not raw_to:
-        raise ValueError("TWILIO_TO_NUMBERS (or TWILIO_TO_NUMBER) is required but not set.")
-
-    to_numbers = [x.strip() for x in raw_to.split(",") if x.strip()]
     if not to_numbers:
-        raise ValueError("No destination numbers found in TWILIO_TO_NUMBERS.")
+        raise ValueError("No destination phone numbers provided.")
 
     client = TwilioClient(account_sid, auth_token)
     sids: list[str] = []
     for to in to_numbers:
         msg = client.messages.create(from_=from_number, to=to, body=body)
         sids.append(str(msg.sid))
-    return ", ".join(sids)
-
-
-def send_sms_via_twilio_many(*, bodies: Iterable[str]) -> list[str]:
-    # Send each body as its own SMS (avoids concatenation/segment surprises).
-    all_sids: list[str] = []
-    for body in bodies:
-        sids = send_sms_via_twilio(body=body)
-        all_sids.extend([x.strip() for x in sids.split(",") if x.strip()])
-    return all_sids
+    return sids
 
 
 def log_sources(
@@ -327,6 +458,8 @@ def log_sources(
     sources: Iterable[dict[str, str]],
     model: str,
     web_search_queries: list[str] | None = None,
+    recipient_count: int | None = None,
+    sms_template: str | None = None,
 ) -> None:
     log_dir = Path(os.environ.get("LOG_DIR", "logs"))
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -337,6 +470,8 @@ def log_sources(
         "model": model,
         "sources": list(sources),
         "web_search_queries": list(web_search_queries or []),
+        "recipient_count": recipient_count,
+        "sms_template": sms_template,
     }
     path.write_text("", encoding="utf-8") if not path.exists() else None
     with path.open("a", encoding="utf-8") as f:
@@ -354,56 +489,74 @@ def main() -> None:
     model = (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
     region = (os.environ.get("REGION") or "Ontario, Canada").strip()
     tz_name = (os.environ.get("TIMEZONE") or "America/Toronto").strip()
-    sms_template = (os.environ.get("SMS_TEMPLATE") or "compact").strip()
-    sms_max_len = int((os.environ.get("SMS_MAX_LEN") or "122").strip())
+    sms_template_default = _validated_sms_template(os.environ.get("SMS_TEMPLATE") or "compact")
 
-    cities = _parse_cities()
+    recipients = _parse_recipients_from_env(default_template=sms_template_default)
+    if not recipients:
+        raise SystemExit(
+            "Set RECIPIENTS (multiline 'phone, city[, template]' in .env) or RECIPIENTS_FILE. "
+            "See .env.example."
+        )
+    city_groups = _group_recipients_by_city_and_template(recipients)
+
     errors: list[str] = []
-    sms_bodies: list[str] = []
+    all_sids: list[str] = []
+    any_success = False
 
-    for city in cities:
+    for city_key, city_label, tmpl, phones in city_groups:
         try:
             if debug:
-                print(f"→ Generating Gemini forecast for {city}...")
+                print(
+                    f"→ Generating Gemini forecast for {city_label!r} [{tmpl}] ({len(phones)} recipient(s))..."
+                )
             forecast, sources, web_queries = generate_forecast_with_gemini(
-                city=city,
+                city=city_label,
                 region=region,
                 model=model,
                 api_key=api_key,
                 tz_name=tz_name,
             )
             log_sources(
-                city=city,
+                city=city_label,
                 sources=sources,
                 model=model,
                 web_search_queries=web_queries,
+                recipient_count=len(phones),
+                sms_template=tmpl,
             )
-            sms_bodies.append(
-                format_sms_with_template(
-                    forecast,
-                    template=sms_template,
-                    max_len=sms_max_len,
-                )
+            body = format_sms_with_template(
+                forecast,
+                template=tmpl,
+                max_len=_sms_max_len_for_template(tmpl),
             )
+
+            if dry_run:
+                print(f"--- {city_label} ({city_key}) [{tmpl}] — {len(phones)} number(s) ---")
+                for p in phones:
+                    print(f"  → {p}")
+                print(body)
+                print()
+                any_success = True
+                continue
+
+            sids = send_sms_via_twilio(body=body, to_numbers=phones)
+            all_sids.extend(sids)
+            any_success = True
         except Exception as e:
-            errors.append(f"[ERROR] {city}: {e}")
+            errors.append(f"[ERROR] {city_label} [{tmpl}]: {e}")
 
     if errors:
         for e in errors:
             print(e, file=sys.stderr)
 
-    if not sms_bodies:
+    if not any_success:
         raise SystemExit(1)
 
     if dry_run:
-        for b in sms_bodies:
-            print(b)
-            print()
         return
 
-    sids = send_sms_via_twilio_many(bodies=sms_bodies)
     if debug:
-        print(f"✓ Sent SMS via Twilio. Message SID(s): {', '.join(sids)}")
+        print(f"✓ Sent SMS via Twilio. Message SID(s): {', '.join(all_sids)}")
 
 
 if __name__ == "__main__":

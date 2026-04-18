@@ -12,7 +12,23 @@ It uses **Gemini with Google Search grounding** for web research, logs the sourc
 Create your env file:
 
 - Copy `.env.example` to `.env`
-- Fill in `GEMINI_API_KEY` and Twilio credentials/numbers
+- Fill in `GEMINI_API_KEY`, Twilio credentials, and **`RECIPIENTS`** (or **`RECIPIENTS_FILE`**)
+
+### Recipients (phone + city [+ template])
+
+Use **`RECIPIENTS`** (multiline: `phone, city` or `phone, city, template`) or **`RECIPIENTS_FILE`**. **`template`** is `compact` or `detailed` and is optional; if omitted, **`SMS_TEMPLATE`** applies to that line.
+
+Groups are **city + template** (city match is case-insensitive): **one Gemini request per group**; every number in the group gets the same SMS. Same city with different templates means separate Gemini calls.
+
+In `.env`, multiline values must be **double-quoted**:
+
+```env
+RECIPIENTS="123-456-7890, waterloo, compact
+324-543-2356, burlington, detailed
+324-352-2356, waterloo"
+```
+
+10-digit numbers are normalized to **+1** by default (`DEFAULT_PHONE_COUNTRY_PREFIX=1`).
 
 Install dependencies:
 
@@ -41,9 +57,10 @@ DRY_RUN=false python forecast.py
 This project defaults to **122 characters** max per SMS body (configurable).
 
 Configure with:
-- `SMS_TEMPLATE=compact` (default; tomorrow’s expected ¢/L, then recommendation)
-- `SMS_TEMPLATE=detailed` (full multi-line briefing)
-- `SMS_MAX_LEN=122`
+- `SMS_TEMPLATE=compact` or `detailed` — default for recipient lines that omit the third field
+- Per row: `phone, city, compact` or `phone, city, detailed` in **`RECIPIENTS`**
+- `SMS_MAX_LEN` — applies to **`compact`** only (e.g. `122`)
+- `SMS_MAX_LEN_DETAILED` — applies to **`detailed`** only; default **`0`** = send the full briefing (often multiple SMS segments). Optional aliases: `detail`, `short` for templates in `RECIPIENTS`
 
 ## Source logging
 

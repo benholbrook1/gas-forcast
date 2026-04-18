@@ -1,1 +1,4 @@
 .env
+recipients.txt
+logs/
+__pycache__/
