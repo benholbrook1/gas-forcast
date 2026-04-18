@@ -26,6 +26,7 @@ from twilio.rest import Client as TwilioClient
 @dataclass(frozen=True)
 class Forecast:
     city: str
+    today_average_price_cents_per_liter: float | None
     tomorrow_expected_price_cents_per_liter: float
     influences: list[str]
     notable_information: list[str]
@@ -321,12 +322,14 @@ Target date (tomorrow): {target_date}
 
 Task:
 - Use web search to find the most relevant and recent information that could influence regular gasoline prices in this location between now and tomorrow.
+- Estimate today's area-average regular gas price (pump-style cents per liter) from recent local sources when possible.
 - Produce a best-estimate prediction for tomorrow's expected pump price in cents per liter (e.g. 152.9).
 - Provide a short, practical recommendation. Do not include anything about checking local gas price apps. Justify your recommendation.
 
 Output requirements (STRICT JSON ONLY):
 {{
   "city": string,
+  "today_average_price_cents_per_liter": number | null,   // best estimate for today; null only if no usable data
   "tomorrow_expected_price_cents_per_liter": number,   // numeric pump-style price (e.g. 152.9)
   "influences": [string, ...],                 // 2-5 bullets, each < 110 chars
   "notable_information": [string, ...],        // 1-3 bullets, each < 140 chars
@@ -348,8 +351,16 @@ Guidance:
     if cents is None:
         raise ValueError("Gemini response missing tomorrow_expected_price_cents_per_liter")
 
+    today_cents: float | None = None
+    raw_today = data.get("today_average_price_cents_per_liter", None)
+    if raw_today is None and "today_average_price_per_liter" in data:
+        raw_today = float(data["today_average_price_per_liter"]) * 100.0
+    if raw_today is not None:
+        today_cents = float(raw_today)
+
     forecast = Forecast(
         city=str(data.get("city") or city),
+        today_average_price_cents_per_liter=today_cents,
         tomorrow_expected_price_cents_per_liter=float(cents),
         influences=[str(x) for x in (data.get("influences") or [])][:5],
         notable_information=[str(x) for x in (data.get("notable_information") or [])][:3],
@@ -372,6 +383,12 @@ def _truncate(s: str, max_len: int) -> str:
     return s[: max_len - 1].rstrip() + "…"
 
 
+def _fmt_cents_per_liter(x: float | None) -> str:
+    if x is None:
+        return "N/A"
+    return f"{x:.1f}¢/L"
+
+
 def format_sms_with_template(
     forecast: Forecast,
     *,
@@ -391,7 +408,11 @@ def format_sms_with_template(
         lines: list[str] = []
         lines.append("Gas Forecast")
         lines.append("")
-        lines.append(f"Tomorrow's Expected Price: {forecast.tomorrow_expected_price_cents_per_liter:.1f}¢/L")
+        lines.append(f"Today's Average: {_fmt_cents_per_liter(forecast.today_average_price_cents_per_liter)}")
+        lines.append("")
+        lines.append(
+            f"Tomorrow's Expected Price: {forecast.tomorrow_expected_price_cents_per_liter:.1f}¢/L"
+        )
         lines.append("")
         lines.append("Current Influences:")
         for item in (forecast.influences or [])[:5]:
@@ -416,17 +437,18 @@ def format_sms_with_template(
         return body[: max_len - 1].rstrip() + "…"
 
     if template == "compact":
+        today_line = f"Today's Average: {_fmt_cents_per_liter(forecast.today_average_price_cents_per_liter)}"
         price_line = f"Tomorrow's Expected Price: {forecast.tomorrow_expected_price_cents_per_liter:.1f}¢/L"
         rec = _squeeze(forecast.recommendation)
         sep = "\n\n"
         rec_prefix = "Recommendation: "
-        body = f"{price_line}{sep}{rec_prefix}{rec}"
+        body = f"{today_line}{sep}{price_line}{sep}{rec_prefix}{rec}"
 
         if max_len <= 0 or len(body) <= max_len:
             return body
 
-        # Keep the price line; truncate recommendation only.
-        header = f"{price_line}{sep}{rec_prefix}"
+        # Keep both price lines; truncate recommendation only.
+        header = f"{today_line}{sep}{price_line}{sep}{rec_prefix}"
         if len(header) >= max_len:
             return _truncate(body, max_len)
         room = max_len - len(header)
