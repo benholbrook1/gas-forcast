@@ -2,9 +2,8 @@ name: Daily Gas Forecast SMS
 
 on:
   schedule:
-    # 22:00 UTC = 6:00 PM EST (UTC-5) / 7:00 PM EDT (UTC-4)
-    # Adjust to 23:00 UTC during EDT (Mar–Nov) if you prefer strict 6 PM local time.
-    - cron: "0 22 * * *"
+    # 21:00 UTC = 5:00 PM EST (UTC-5) / 7:00 PM EDT (UTC-4)
+    - cron: "0 21 * * *"
 
   # Allow manual trigger from the Actions tab for testing
   workflow_dispatch:
