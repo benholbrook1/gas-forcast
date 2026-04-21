@@ -2,8 +2,9 @@ name: Daily Gas Forecast SMS
 
 on:
   schedule:
-    # 21:00 UTC = 5:00 PM EST (UTC-5) / 7:00 PM EDT (UTC-4)
-    - cron: "0 21 * * *"
+    # ~4:45 PM America/Toronto: two UTC times cover EST vs EDT (GitHub cron is UTC-only).
+    - cron: "45 20 * * *"
+    - cron: "45 21 * * *"
 
   # Allow manual trigger from the Actions tab for testing
   workflow_dispatch:
@@ -11,7 +12,7 @@ on:
 jobs:
   send-forecast:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -27,7 +28,8 @@ jobs:
         run: pip install -r requirements.txt
 
       # Required: GEMINI_API_KEY, TWILIO_*, multiline RECIPIENTS ("phone, city" per line).
-      # Optional: GEMINI_MODEL, REGION, TIMEZONE, SMS_TEMPLATE, SMS_MAX_LEN, SMS_MAX_LEN_DETAILED, DRY_RUN.
+      # Optional: GEMINI_MODEL, GEMINI_MAX_RETRIES, GEMINI_RETRY_*_SECONDS, REGION, TIMEZONE,
+      # SMS_TEMPLATE, SMS_MAX_LEN, SMS_MAX_LEN_DETAILED, DRY_RUN, FORCE_FORECAST, DEBUG.
       - name: Run forecast script
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +21,7 @@ from collections import OrderedDict
 
 from dotenv import load_dotenv
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from twilio.rest import Client as TwilioClient
 
@@ -302,6 +305,75 @@ def _extract_grounding_web_search_queries(resp: types.GenerateContentResponse) -
     return [str(x) for x in q if x is not None]
 
 
+def _retryable_genai_api_error(exc: BaseException) -> bool:
+    """Transient overload / capacity errors from the Gemini API."""
+    if isinstance(exc, genai_errors.ServerError):
+        return True
+    if isinstance(exc, genai_errors.ClientError):
+        code = getattr(exc, "code", None)
+        status = (getattr(exc, "status", None) or "").upper()
+        if code == 429:
+            return True
+        if status in ("UNAVAILABLE", "RESOURCE_EXHAUSTED"):
+            return True
+    return False
+
+
+def _scheduled_send_local_ok(*, tz_name: str) -> bool:
+    """
+    True when local wall clock is near the intended SMS time (4:45 PM).
+
+    GitHub Actions ``schedule`` uses UTC only, so we use two UTC crons (DST vs
+    standard) and skip runs that fire at the ``wrong`` offset for the season.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+    now = datetime.now(tz)
+    h, m = now.hour, now.minute
+    # 4:35–4:59 PM, or up to 5:10 PM if the runner was delayed.
+    if h == 16 and m >= 35:
+        return True
+    if h == 17 and m <= 10:
+        return True
+    return False
+
+
+def _generate_content_with_retries(
+    *,
+    client: genai.Client,
+    model: str,
+    prompt: str,
+    config: types.GenerateContentConfig,
+    debug: bool,
+) -> types.GenerateContentResponse:
+    raw_max = (os.environ.get("GEMINI_MAX_RETRIES") or "6").strip()
+    max_attempts = max(1, int(raw_max or "6"))
+    base = float((os.environ.get("GEMINI_RETRY_BASE_SECONDS") or "4.0").strip() or "4.0")
+    cap = float((os.environ.get("GEMINI_RETRY_MAX_SECONDS") or "90.0").strip() or "90.0")
+
+    for attempt in range(max_attempts):
+        try:
+            return client.models.generate_content(
+                model=model, contents=prompt, config=config
+            )
+        except Exception as e:
+            if not _retryable_genai_api_error(e) or attempt >= max_attempts - 1:
+                raise
+            delay = min(cap, base * (2**attempt))
+            delay += random.uniform(0.0, min(3.0, max(0.5, delay * 0.15)))
+            if debug:
+                print(
+                    f"Gemini call failed ({e!r}); sleeping {delay:.1f}s "
+                    f"before retry {attempt + 2}/{max_attempts}...",
+                    file=sys.stderr,
+                )
+            time.sleep(delay)
+
+
 def generate_forecast_with_gemini(
     *, city: str, region: str, model: str, api_key: str, tz_name: str
 ) -> tuple[Forecast, list[dict[str, str]], list[str]]:
@@ -341,7 +413,13 @@ Guidance:
 - Keep it grounded in facts from sources you find; do not invent specific events.
 """.strip()
 
-    resp = client.models.generate_content(model=model, contents=prompt, config=config)
+    resp = _generate_content_with_retries(
+        client=client,
+        model=model,
+        prompt=prompt,
+        config=config,
+        debug=_env_bool("DEBUG", False),
+    )
     data = _safe_json_loads(resp.text or "")
 
     # Backward/robustness: if the model returns dollars/L by mistake, convert.
@@ -506,11 +584,22 @@ def main() -> None:
 
     debug = _env_bool("DEBUG", False)
     dry_run = _env_bool("DRY_RUN", False)
+    tz_name = (os.environ.get("TIMEZONE") or "America/Toronto").strip()
+
+    if os.environ.get("GITHUB_EVENT_NAME") == "schedule" and not _env_bool(
+        "FORCE_FORECAST", False
+    ):
+        if not _scheduled_send_local_ok(tz_name=tz_name):
+            print(
+                f"Skipping: local time in {tz_name!r} is outside the send window "
+                "(expected ~4:45 PM).",
+                file=sys.stderr,
+            )
+            return
 
     api_key = _env_required("GEMINI_API_KEY")
     model = (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
     region = (os.environ.get("REGION") or "Ontario, Canada").strip()
-    tz_name = (os.environ.get("TIMEZONE") or "America/Toronto").strip()
     sms_template_default = _validated_sms_template(os.environ.get("SMS_TEMPLATE") or "compact")
 
     recipients = _parse_recipients_from_env(default_template=sms_template_default)
