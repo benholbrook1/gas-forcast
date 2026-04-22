@@ -319,29 +319,6 @@ def _retryable_genai_api_error(exc: BaseException) -> bool:
     return False
 
 
-def _scheduled_send_local_ok(*, tz_name: str) -> bool:
-    """
-    True when local wall clock is near the intended SMS time (4:45 PM).
-
-    GitHub Actions ``schedule`` uses UTC only, so we use two UTC crons (DST vs
-    standard) and skip runs that fire at the ``wrong`` offset for the season.
-    """
-    try:
-        from zoneinfo import ZoneInfo
-
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = timezone.utc
-    now = datetime.now(tz)
-    h, m = now.hour, now.minute
-    # 4:35–4:59 PM, or up to 5:10 PM if the runner was delayed.
-    if h == 16 and m >= 35:
-        return True
-    if h == 17 and m <= 10:
-        return True
-    return False
-
-
 def _generate_content_with_retries(
     *,
     client: genai.Client,
@@ -585,17 +562,6 @@ def main() -> None:
     debug = _env_bool("DEBUG", False)
     dry_run = _env_bool("DRY_RUN", False)
     tz_name = (os.environ.get("TIMEZONE") or "America/Toronto").strip()
-
-    if os.environ.get("GITHUB_EVENT_NAME") == "schedule" and not _env_bool(
-        "FORCE_FORECAST", False
-    ):
-        if not _scheduled_send_local_ok(tz_name=tz_name):
-            print(
-                f"Skipping: local time in {tz_name!r} is outside the send window "
-                "(expected ~4:45 PM).",
-                file=sys.stderr,
-            )
-            return
 
     api_key = _env_required("GEMINI_API_KEY")
     model = (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()

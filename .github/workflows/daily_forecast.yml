@@ -2,9 +2,8 @@ name: Daily Gas Forecast SMS
 
 on:
   schedule:
-    # ~4:45 PM America/Toronto: two UTC times cover EST vs EDT (GitHub cron is UTC-only).
-    - cron: "45 20 * * *"
-    - cron: "45 21 * * *"
+    # 21:00 UTC = 4:00 PM EST (winter) / 5:00 PM EDT (summer). Single fixed UTC time, no DST handling.
+    - cron: "0 21 * * *"
 
   # Allow manual trigger from the Actions tab for testing
   workflow_dispatch:
@@ -29,7 +28,7 @@ jobs:
 
       # Required: GEMINI_API_KEY, TWILIO_*, multiline RECIPIENTS ("phone, city" per line).
       # Optional: GEMINI_MODEL, GEMINI_MAX_RETRIES, GEMINI_RETRY_*_SECONDS, REGION, TIMEZONE,
-      # SMS_TEMPLATE, SMS_MAX_LEN, SMS_MAX_LEN_DETAILED, DRY_RUN, FORCE_FORECAST, DEBUG.
+      # SMS_TEMPLATE, SMS_MAX_LEN, SMS_MAX_LEN_DETAILED, DRY_RUN, DEBUG.
       - name: Run forecast script
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
